@@ -20,6 +20,7 @@ from sklearn.neighbors import KNeighborsClassifier
 
 
 UNLABELED_TOKENS = {"", "unlabeled", "ungated"}
+PREDICT_BATCH_SIZE = 20_000
 
 
 def _extract_sample_number(sample_name: str) -> Optional[str]:
@@ -179,6 +180,23 @@ def _fit_model(train_matrix: pd.DataFrame, train_labels: np.ndarray) -> tuple[KN
     return classifier, k
 
 
+def _predict_in_batches(
+    model: KNeighborsClassifier, sample_matrix: np.ndarray, batch_size: int = PREDICT_BATCH_SIZE
+) -> np.ndarray:
+    if batch_size <= 0:
+        raise ValueError("Predict batch size must be > 0.")
+
+    total_rows = sample_matrix.shape[0]
+    if total_rows == 0:
+        return np.array([], dtype=int)
+
+    chunks: list[np.ndarray] = []
+    for start_idx in range(0, total_rows, batch_size):
+        end_idx = min(start_idx + batch_size, total_rows)
+        chunks.append(model.predict(sample_matrix[start_idx:end_idx]))
+    return np.concatenate(chunks)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="clustbench KNN runner")
     parser.add_argument("--data.train_matrix", type=str, required=True)
@@ -207,7 +225,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         output_files: list[str] = []
         for idx, (_, sample_df, sample_number) in enumerate(test_samples, start=1):
-            predictions = model.predict(sample_df.to_numpy())
+            predictions = _predict_in_batches(model, sample_df.to_numpy())
             out_labels = [str(int(label)) for label in predictions]
 
             if sample_number is None:
