@@ -21,6 +21,21 @@ from sklearn.neighbors import KNeighborsClassifier
 
 UNLABELED_TOKENS = {"", "unlabeled", "ungated"}
 PREDICT_BATCH_SIZE = 20_000
+DEFAULT_RESERVED_CORES = 2
+
+
+def _resolve_n_jobs() -> int:
+    env_value = os.getenv("KNN_N_JOBS")
+    if env_value is not None and env_value.strip() != "":
+        try:
+            parsed = int(env_value)
+            if parsed > 0:
+                return parsed
+        except ValueError:
+            pass
+
+    cpu_count = os.cpu_count() or 1
+    return max(1, cpu_count - DEFAULT_RESERVED_CORES)
 
 
 def _extract_sample_number(sample_name: str) -> Optional[str]:
@@ -156,7 +171,9 @@ def _compute_k(total_cells: int, smallest_population_size: int, labeled_cells: i
     return min(bounded_k, labeled_cells)
 
 
-def _fit_model(train_matrix: pd.DataFrame, train_labels: np.ndarray) -> tuple[KNeighborsClassifier, int]:
+def _fit_model(
+    train_matrix: pd.DataFrame, train_labels: np.ndarray, n_jobs: int
+) -> tuple[KNeighborsClassifier, int]:
     if len(train_matrix) != len(train_labels):
         raise ValueError(
             "Number of labels does not match rows in training matrix "
@@ -175,7 +192,7 @@ def _fit_model(train_matrix: pd.DataFrame, train_labels: np.ndarray) -> tuple[KN
     total_cells = int(len(train_matrix))
     k = _compute_k(total_cells, smallest_population_size, labeled_cells)
 
-    classifier = KNeighborsClassifier(n_neighbors=k)
+    classifier = KNeighborsClassifier(n_neighbors=k, n_jobs=n_jobs)
     classifier.fit(train_matrix.loc[labeled_mask].to_numpy(), labeled_labels.to_numpy())
     return classifier, k
 
@@ -215,8 +232,10 @@ def main() -> None:
     train_labels = _load_labels(getattr(args, "data.train_labels"))
     test_samples = _load_test_samples(getattr(args, "data.test_matrix"))
 
-    model, k = _fit_model(train_matrix, train_labels)
-    print(f"KNN: using computed k={k}", flush=True)
+    n_jobs = _resolve_n_jobs()
+
+    model, k = _fit_model(train_matrix, train_labels, n_jobs=n_jobs)
+    print(f"KNN: using computed k={k} with n_jobs={n_jobs}", flush=True)
 
     output_tar = os.path.join(output_dir, f"{name}_predicted_labels.tar.gz")
     if os.path.islink(output_tar):
