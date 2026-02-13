@@ -20,10 +20,10 @@ from sklearn.neighbors import KNeighborsClassifier
 
 
 UNLABELED_TOKENS = {"", "unlabeled", "ungated"}
-PREDICT_BATCH_SIZE = 20_000
+PREDICT_BATCH_SIZE = 1_000_000
 DEFAULT_RESERVED_CORES = 2
 MIN_PREDICT_BATCH_SIZE = 500
-TARGET_INDEX_BYTES_PER_BATCH = 512 * 1024 * 1024
+TARGET_INDEX_BYTES_PER_BATCH = 2 * 1024 * 1024 * 1024
 
 
 def _resolve_n_jobs() -> int:
@@ -223,6 +223,8 @@ def _fit_model(
     if labeled_labels.empty:
         raise ValueError("No labeled rows available after excluding unlabeled class 0.")
 
+    x_labeled = train_matrix.loc[labeled_mask]
+
     population_sizes = labeled_labels.value_counts()
     smallest_population_size = int(population_sizes.min())
     num_labels = int(population_sizes.size)
@@ -233,12 +235,16 @@ def _fit_model(
     n_jobs_effective = _cap_n_jobs_for_k(n_jobs, k)
 
     classifier = KNeighborsClassifier(n_neighbors=k, n_jobs=n_jobs_effective)
-    classifier.fit(train_matrix.loc[labeled_mask].to_numpy(), labeled_labels.to_numpy())
+    x_train = np.asarray(x_labeled.to_numpy(dtype=np.float32, copy=False), order="C")
+    y_train = labeled_labels.to_numpy()
+    classifier.fit(x_train, y_train)
     return classifier, k, n_jobs_effective
 
 
 def _predict_in_batches(
-    model: KNeighborsClassifier, sample_matrix: np.ndarray, batch_size: int = PREDICT_BATCH_SIZE
+    model: KNeighborsClassifier,
+    sample_matrix: np.ndarray,
+    batch_size: int = PREDICT_BATCH_SIZE,
 ) -> np.ndarray:
     if batch_size <= 0:
         raise ValueError("Predict batch size must be > 0.")
@@ -247,11 +253,12 @@ def _predict_in_batches(
     if total_rows == 0:
         return np.array([], dtype=int)
 
-    chunks: list[np.ndarray] = []
+    sample_matrix = np.asarray(sample_matrix, dtype=np.float32, order="C")
+    predictions = np.empty(total_rows, dtype=int)
     for start_idx in range(0, total_rows, batch_size):
         end_idx = min(start_idx + batch_size, total_rows)
-        chunks.append(model.predict(sample_matrix[start_idx:end_idx]))
-    return np.concatenate(chunks)
+        predictions[start_idx:end_idx] = model.predict(sample_matrix[start_idx:end_idx])
+    return predictions
 
 
 def main() -> None:
@@ -296,7 +303,9 @@ def main() -> None:
         output_files: list[str] = []
         for idx, (_, sample_df, sample_number) in enumerate(test_samples, start=1):
             predictions = _predict_in_batches(
-                model, sample_df.to_numpy(), batch_size=predict_batch_size
+                model,
+                sample_df.to_numpy(),
+                batch_size=predict_batch_size,
             )
             out_labels = [str(int(label)) for label in predictions]
 
