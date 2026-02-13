@@ -193,14 +193,19 @@ def _load_test_samples(path: str) -> list[tuple[str, pd.DataFrame, Optional[str]
     return samples
 
 
-def _compute_k(total_cells: int, smallest_population_size: int, labeled_cells: int) -> int:
+def _compute_k(
+    total_cells: int, smallest_population_size: int, labeled_cells: int, num_labels: int
+) -> int:
     if total_cells <= 0:
         raise ValueError("Training matrix has no rows.")
     if smallest_population_size <= 0:
         raise ValueError("Smallest labeled population size must be > 0.")
+    if num_labels <= 0:
+        raise ValueError("Number of labeled classes must be > 0.")
     raw_k = math.floor(total_cells / smallest_population_size)
     bounded_k = max(1, raw_k)
-    return min(bounded_k, labeled_cells)
+    class_cap_k = max(1, 2 * num_labels)
+    return min(bounded_k, labeled_cells, class_cap_k)
 
 
 def _fit_model(
@@ -220,9 +225,10 @@ def _fit_model(
 
     population_sizes = labeled_labels.value_counts()
     smallest_population_size = int(population_sizes.min())
+    num_labels = int(population_sizes.size)
     labeled_cells = int(labeled_mask.sum())
     total_cells = int(len(train_matrix))
-    k = _compute_k(total_cells, smallest_population_size, labeled_cells)
+    k = _compute_k(total_cells, smallest_population_size, labeled_cells, num_labels)
 
     n_jobs_effective = _cap_n_jobs_for_k(n_jobs, k)
 
