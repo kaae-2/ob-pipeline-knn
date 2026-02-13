@@ -22,6 +22,8 @@ from sklearn.neighbors import KNeighborsClassifier
 UNLABELED_TOKENS = {"", "unlabeled", "ungated"}
 PREDICT_BATCH_SIZE = 20_000
 DEFAULT_RESERVED_CORES = 2
+MIN_PREDICT_BATCH_SIZE = 500
+TARGET_INDEX_BYTES_PER_BATCH = 512 * 1024 * 1024
 
 
 def _resolve_n_jobs() -> int:
@@ -36,6 +38,36 @@ def _resolve_n_jobs() -> int:
 
     cpu_count = os.cpu_count() or 1
     return max(1, cpu_count - DEFAULT_RESERVED_CORES)
+
+
+def _cap_n_jobs_for_k(requested_n_jobs: int, k: int) -> int:
+    if requested_n_jobs <= 1:
+        return 1
+    if k >= 10_000:
+        return 1
+    if k >= 5_000:
+        return min(requested_n_jobs, 2)
+    if k >= 2_000:
+        return min(requested_n_jobs, 4)
+    return requested_n_jobs
+
+
+def _batch_size_for_k(k: int) -> int:
+    if k <= 0:
+        return PREDICT_BATCH_SIZE
+    max_rows = TARGET_INDEX_BYTES_PER_BATCH // (k * np.dtype(np.int64).itemsize)
+    return max(MIN_PREDICT_BATCH_SIZE, min(PREDICT_BATCH_SIZE, int(max_rows)))
+
+
+def _compute_impute_values(train_matrix: pd.DataFrame) -> pd.Series:
+    medians = train_matrix.median(axis=0, numeric_only=True)
+    medians = medians.fillna(0.0)
+    return medians
+
+
+def _align_and_impute(df: pd.DataFrame, columns: pd.Index, impute_values: pd.Series) -> pd.DataFrame:
+    aligned = df.reindex(columns=columns)
+    return aligned.fillna(impute_values)
 
 
 def _extract_sample_number(sample_name: str) -> Optional[str]:
@@ -173,7 +205,7 @@ def _compute_k(total_cells: int, smallest_population_size: int, labeled_cells: i
 
 def _fit_model(
     train_matrix: pd.DataFrame, train_labels: np.ndarray, n_jobs: int
-) -> tuple[KNeighborsClassifier, int]:
+) -> tuple[KNeighborsClassifier, int, int]:
     if len(train_matrix) != len(train_labels):
         raise ValueError(
             "Number of labels does not match rows in training matrix "
@@ -192,9 +224,11 @@ def _fit_model(
     total_cells = int(len(train_matrix))
     k = _compute_k(total_cells, smallest_population_size, labeled_cells)
 
-    classifier = KNeighborsClassifier(n_neighbors=k, n_jobs=n_jobs)
+    n_jobs_effective = _cap_n_jobs_for_k(n_jobs, k)
+
+    classifier = KNeighborsClassifier(n_neighbors=k, n_jobs=n_jobs_effective)
     classifier.fit(train_matrix.loc[labeled_mask].to_numpy(), labeled_labels.to_numpy())
-    return classifier, k
+    return classifier, k, n_jobs_effective
 
 
 def _predict_in_batches(
@@ -234,8 +268,19 @@ def main() -> None:
 
     n_jobs = _resolve_n_jobs()
 
-    model, k = _fit_model(train_matrix, train_labels, n_jobs=n_jobs)
-    print(f"KNN: using computed k={k} with n_jobs={n_jobs}", flush=True)
+    impute_values = _compute_impute_values(train_matrix)
+    train_matrix = _align_and_impute(train_matrix, train_matrix.columns, impute_values)
+    test_samples = [
+        (sample_name, _align_and_impute(sample_df, train_matrix.columns, impute_values), sample_number)
+        for sample_name, sample_df, sample_number in test_samples
+    ]
+
+    model, k, n_jobs_effective = _fit_model(train_matrix, train_labels, n_jobs=n_jobs)
+    predict_batch_size = _batch_size_for_k(k)
+    print(
+        f"KNN: using computed k={k} with n_jobs={n_jobs_effective}, batch_size={predict_batch_size}",
+        flush=True,
+    )
 
     output_tar = os.path.join(output_dir, f"{name}_predicted_labels.tar.gz")
     if os.path.islink(output_tar):
@@ -244,7 +289,9 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         output_files: list[str] = []
         for idx, (_, sample_df, sample_number) in enumerate(test_samples, start=1):
-            predictions = _predict_in_batches(model, sample_df.to_numpy())
+            predictions = _predict_in_batches(
+                model, sample_df.to_numpy(), batch_size=predict_batch_size
+            )
             out_labels = [str(int(label)) for label in predictions]
 
             if sample_number is None:
