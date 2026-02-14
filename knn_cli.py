@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import gzip
 import io
-import math
 import os
 import re
 import sys
@@ -16,7 +15,11 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-from sklearn.neighbors import KNeighborsClassifier
+from knn_model import (
+    batch_size_for_k,
+    fit_prototype_model,
+    predict_in_batches,
+)
 
 
 UNLABELED_TOKENS = {"", "unlabeled", "ungated"}
@@ -24,6 +27,7 @@ PREDICT_BATCH_SIZE = 1_000_000
 DEFAULT_RESERVED_CORES = 2
 MIN_PREDICT_BATCH_SIZE = 500
 TARGET_INDEX_BYTES_PER_BATCH = 2 * 1024 * 1024 * 1024
+DEFAULT_PROTOTYPES_PER_CLASS = 8
 
 
 def _resolve_n_jobs() -> int:
@@ -40,23 +44,24 @@ def _resolve_n_jobs() -> int:
     return max(1, cpu_count - DEFAULT_RESERVED_CORES)
 
 
-def _cap_n_jobs_for_k(requested_n_jobs: int, k: int) -> int:
-    if requested_n_jobs <= 1:
-        return 1
-    if k >= 10_000:
-        return 1
-    if k >= 5_000:
-        return min(requested_n_jobs, 2)
-    if k >= 2_000:
-        return min(requested_n_jobs, 4)
-    return requested_n_jobs
+def _resolve_prototypes_per_class() -> int:
+    env_value = os.getenv("KNN_PROTOTYPES_PER_CLASS")
+    if env_value is not None and env_value.strip() != "":
+        try:
+            parsed = int(env_value)
+            if parsed > 0:
+                return parsed
+        except ValueError:
+            pass
+    return DEFAULT_PROTOTYPES_PER_CLASS
 
 
-def _batch_size_for_k(k: int) -> int:
-    if k <= 0:
-        return PREDICT_BATCH_SIZE
-    max_rows = TARGET_INDEX_BYTES_PER_BATCH // (k * np.dtype(np.int64).itemsize)
-    return max(MIN_PREDICT_BATCH_SIZE, min(PREDICT_BATCH_SIZE, int(max_rows)))
+def _configure_thread_env(n_jobs: int) -> None:
+    value = str(max(1, n_jobs))
+    os.environ["OMP_NUM_THREADS"] = value
+    os.environ["OPENBLAS_NUM_THREADS"] = value
+    os.environ["MKL_NUM_THREADS"] = value
+    os.environ["NUMEXPR_NUM_THREADS"] = value
 
 
 def _compute_impute_values(train_matrix: pd.DataFrame) -> pd.Series:
@@ -193,74 +198,6 @@ def _load_test_samples(path: str) -> list[tuple[str, pd.DataFrame, Optional[str]
     return samples
 
 
-def _compute_k(
-    total_cells: int, smallest_population_size: int, labeled_cells: int, num_labels: int
-) -> int:
-    if total_cells <= 0:
-        raise ValueError("Training matrix has no rows.")
-    if smallest_population_size <= 0:
-        raise ValueError("Smallest labeled population size must be > 0.")
-    if num_labels <= 0:
-        raise ValueError("Number of labeled classes must be > 0.")
-    raw_k = math.floor(total_cells / smallest_population_size)
-    bounded_k = max(1, raw_k)
-    class_cap_k = max(1, 2 * num_labels)
-    return min(bounded_k, labeled_cells, class_cap_k)
-
-
-def _fit_model(
-    train_matrix: pd.DataFrame, train_labels: np.ndarray, n_jobs: int
-) -> tuple[KNeighborsClassifier, int, int]:
-    if len(train_matrix) != len(train_labels):
-        raise ValueError(
-            "Number of labels does not match rows in training matrix "
-            f"({len(train_labels)} != {len(train_matrix)})."
-        )
-
-    labels_series = pd.Series(train_labels)
-    labeled_mask = labels_series.notna()
-    labeled_labels = labels_series[labeled_mask].astype(int)
-    if labeled_labels.empty:
-        raise ValueError("No labeled rows available after excluding unlabeled class 0.")
-
-    x_labeled = train_matrix.loc[labeled_mask]
-
-    population_sizes = labeled_labels.value_counts()
-    smallest_population_size = int(population_sizes.min())
-    num_labels = int(population_sizes.size)
-    labeled_cells = int(labeled_mask.sum())
-    total_cells = int(len(train_matrix))
-    k = _compute_k(total_cells, smallest_population_size, labeled_cells, num_labels)
-
-    n_jobs_effective = _cap_n_jobs_for_k(n_jobs, k)
-
-    classifier = KNeighborsClassifier(n_neighbors=k, n_jobs=n_jobs_effective)
-    x_train = np.asarray(x_labeled.to_numpy(dtype=np.float32, copy=False), order="C")
-    y_train = labeled_labels.to_numpy()
-    classifier.fit(x_train, y_train)
-    return classifier, k, n_jobs_effective
-
-
-def _predict_in_batches(
-    model: KNeighborsClassifier,
-    sample_matrix: np.ndarray,
-    batch_size: int = PREDICT_BATCH_SIZE,
-) -> np.ndarray:
-    if batch_size <= 0:
-        raise ValueError("Predict batch size must be > 0.")
-
-    total_rows = sample_matrix.shape[0]
-    if total_rows == 0:
-        return np.array([], dtype=int)
-
-    sample_matrix = np.asarray(sample_matrix, dtype=np.float32, order="C")
-    predictions = np.empty(total_rows, dtype=int)
-    for start_idx in range(0, total_rows, batch_size):
-        end_idx = min(start_idx + batch_size, total_rows)
-        predictions[start_idx:end_idx] = model.predict(sample_matrix[start_idx:end_idx])
-    return predictions
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="clustbench KNN runner")
     parser.add_argument("--data.train_matrix", type=str, required=True)
@@ -280,6 +217,8 @@ def main() -> None:
     test_samples = _load_test_samples(getattr(args, "data.test_matrix"))
 
     n_jobs = _resolve_n_jobs()
+    prototypes_per_class = _resolve_prototypes_per_class()
+    _configure_thread_env(n_jobs)
 
     impute_values = _compute_impute_values(train_matrix)
     train_matrix = _align_and_impute(train_matrix, train_matrix.columns, impute_values)
@@ -288,10 +227,24 @@ def main() -> None:
         for sample_name, sample_df, sample_number in test_samples
     ]
 
-    model, k, n_jobs_effective = _fit_model(train_matrix, train_labels, n_jobs=n_jobs)
-    predict_batch_size = _batch_size_for_k(k)
+    model, fit_stats = fit_prototype_model(
+        train_matrix=np.asarray(train_matrix.to_numpy(dtype=np.float32, copy=False), order='C'),
+        train_labels=train_labels,
+        requested_n_jobs=n_jobs,
+        prototypes_per_class=prototypes_per_class,
+    )
+    predict_batch_size = batch_size_for_k(
+        fit_stats.k,
+        default_batch_size=PREDICT_BATCH_SIZE,
+        min_batch_size=MIN_PREDICT_BATCH_SIZE,
+        target_index_bytes_per_batch=TARGET_INDEX_BYTES_PER_BATCH,
+    )
     print(
-        f"KNN: using computed k={k} with n_jobs={n_jobs_effective}, batch_size={predict_batch_size}",
+        (
+            f"KNN-approx: k={fit_stats.k}, n_jobs={fit_stats.n_jobs_effective}, "
+            f"batch_size={predict_batch_size}, prototypes={fit_stats.prototype_count}, "
+            f"per_class={prototypes_per_class}"
+        ),
         flush=True,
     )
 
@@ -302,7 +255,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         output_files: list[str] = []
         for idx, (_, sample_df, sample_number) in enumerate(test_samples, start=1):
-            predictions = _predict_in_batches(
+            predictions = predict_in_batches(
                 model,
                 sample_df.to_numpy(),
                 batch_size=predict_batch_size,
