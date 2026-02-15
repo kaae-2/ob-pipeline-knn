@@ -203,6 +203,7 @@ def main() -> None:
     parser.add_argument("--data.train_matrix", type=str, required=True)
     parser.add_argument("--data.train_labels", type=str, required=True)
     parser.add_argument("--data.test_matrix", type=str, required=True)
+    parser.add_argument("--data.label_key", type=str, required=False)
     parser.add_argument("--output_dir", type=str, required=False)
     parser.add_argument("--name", type=str, default="clustbench")
 
