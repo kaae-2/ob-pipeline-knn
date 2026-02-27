@@ -75,6 +75,12 @@ def _align_and_impute(df: pd.DataFrame, columns: pd.Index, impute_values: pd.Ser
     return aligned.fillna(impute_values)
 
 
+def _arcsinh_transform(df: pd.DataFrame, cofactor: float = 5.0) -> pd.DataFrame:
+    values = df.to_numpy(dtype=np.float32, copy=False)
+    transformed = np.arcsinh(values / cofactor)
+    return pd.DataFrame(transformed, columns=df.columns)
+
+
 def _extract_sample_number(sample_name: str) -> Optional[str]:
     base = os.path.basename(sample_name)
     while True:
@@ -225,6 +231,13 @@ def main() -> None:
     train_matrix = _align_and_impute(train_matrix, train_matrix.columns, impute_values)
     test_samples = [
         (sample_name, _align_and_impute(sample_df, train_matrix.columns, impute_values), sample_number)
+        for sample_name, sample_df, sample_number in test_samples
+    ]
+
+    print("KNN: applying arcsinh transform (cofactor=5)", flush=True)
+    train_matrix = _arcsinh_transform(train_matrix, cofactor=5.0)
+    test_samples = [
+        (sample_name, _arcsinh_transform(sample_df, cofactor=5.0), sample_number)
         for sample_name, sample_df, sample_number in test_samples
     ]
 
