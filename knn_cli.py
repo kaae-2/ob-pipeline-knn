@@ -26,8 +26,9 @@ UNLABELED_TOKENS = {"", "unlabeled", "ungated"}
 PREDICT_BATCH_SIZE = 1_000_000
 DEFAULT_RESERVED_CORES = 2
 MIN_PREDICT_BATCH_SIZE = 500
-TARGET_INDEX_BYTES_PER_BATCH = 2 * 1024 * 1024 * 1024
 DEFAULT_PROTOTYPES_PER_CLASS = 8
+DEFAULT_KNN_N_JOBS = 4
+DEFAULT_TARGET_INDEX_BYTES_PER_BATCH = 1024 * 1024 * 1024
 
 
 def _resolve_n_jobs() -> int:
@@ -40,8 +41,17 @@ def _resolve_n_jobs() -> int:
         except ValueError:
             pass
 
+    default_n_jobs = os.getenv("KNN_DEFAULT_N_JOBS")
+    if default_n_jobs is not None and default_n_jobs.strip() != "":
+        try:
+            parsed = int(default_n_jobs)
+            if parsed > 0:
+                return parsed
+        except ValueError:
+            pass
+
     cpu_count = os.cpu_count() or 1
-    return max(1, cpu_count - DEFAULT_RESERVED_CORES)
+    return max(1, min(DEFAULT_KNN_N_JOBS, cpu_count - DEFAULT_RESERVED_CORES))
 
 
 def _resolve_prototypes_per_class() -> int:
@@ -54,6 +64,30 @@ def _resolve_prototypes_per_class() -> int:
         except ValueError:
             pass
     return DEFAULT_PROTOTYPES_PER_CLASS
+
+
+def _resolve_predict_batch_size() -> int:
+    env_value = os.getenv("KNN_PREDICT_BATCH_SIZE")
+    if env_value is not None and env_value.strip() != "":
+        try:
+            parsed = int(env_value)
+            if parsed > 0:
+                return parsed
+        except ValueError:
+            pass
+    return PREDICT_BATCH_SIZE
+
+
+def _resolve_target_index_bytes_per_batch() -> int:
+    env_value = os.getenv("KNN_TARGET_INDEX_BYTES_PER_BATCH")
+    if env_value is not None and env_value.strip() != "":
+        try:
+            parsed = int(env_value)
+            if parsed > 0:
+                return parsed
+        except ValueError:
+            pass
+    return DEFAULT_TARGET_INDEX_BYTES_PER_BATCH
 
 
 def _configure_thread_env(n_jobs: int) -> None:
@@ -219,6 +253,8 @@ def main() -> None:
 
     n_jobs = _resolve_n_jobs()
     prototypes_per_class = _resolve_prototypes_per_class()
+    predict_batch_size_default = _resolve_predict_batch_size()
+    target_index_bytes_per_batch = _resolve_target_index_bytes_per_batch()
     _configure_thread_env(n_jobs)
 
     impute_values = _compute_impute_values(train_matrix)
@@ -236,15 +272,15 @@ def main() -> None:
     )
     predict_batch_size = batch_size_for_k(
         fit_stats.k,
-        default_batch_size=PREDICT_BATCH_SIZE,
+        default_batch_size=predict_batch_size_default,
         min_batch_size=MIN_PREDICT_BATCH_SIZE,
-        target_index_bytes_per_batch=TARGET_INDEX_BYTES_PER_BATCH,
+        target_index_bytes_per_batch=target_index_bytes_per_batch,
     )
     print(
         (
             f"KNN-approx: k={fit_stats.k}, n_jobs={fit_stats.n_jobs_effective}, "
             f"batch_size={predict_batch_size}, prototypes={fit_stats.prototype_count}, "
-            f"per_class={prototypes_per_class}"
+            f"per_class={prototypes_per_class}, target_index_bytes={target_index_bytes_per_batch}"
         ),
         flush=True,
     )
