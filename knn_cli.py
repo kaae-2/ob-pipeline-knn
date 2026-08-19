@@ -16,19 +16,27 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 from knn_model import (
-    batch_size_for_k,
+    batch_size_for_prototypes,
     fit_prototype_model,
     predict_in_batches,
 )
 
 
-UNLABELED_TOKENS = {"", "unlabeled", "ungated"}
+UNLABELED_TOKENS = {
+    "",
+    "0",
+    "0.0",
+    "ungated",
+    "unknown",
+    "unlabeled",
+    "unlabelled",
+}
 PREDICT_BATCH_SIZE = 1_000_000
 DEFAULT_RESERVED_CORES = 2
-MIN_PREDICT_BATCH_SIZE = 500
 DEFAULT_PROTOTYPES_PER_CLASS = 8
 DEFAULT_KNN_N_JOBS = 4
-DEFAULT_TARGET_INDEX_BYTES_PER_BATCH = 1024 * 1024 * 1024
+DEFAULT_TARGET_WORKING_BYTES_PER_BATCH = 1024 * 1024 * 1024
+MIN_LABEL_AGREEMENT = 0.5
 
 
 def _resolve_n_jobs() -> int:
@@ -78,7 +86,8 @@ def _resolve_predict_batch_size() -> int:
     return PREDICT_BATCH_SIZE
 
 
-def _resolve_target_index_bytes_per_batch() -> int:
+def _resolve_target_working_bytes_per_batch() -> int:
+    # Retain the established environment variable name for existing runners.
     env_value = os.getenv("KNN_TARGET_INDEX_BYTES_PER_BATCH")
     if env_value is not None and env_value.strip() != "":
         try:
@@ -87,7 +96,7 @@ def _resolve_target_index_bytes_per_batch() -> int:
                 return parsed
         except ValueError:
             pass
-    return DEFAULT_TARGET_INDEX_BYTES_PER_BATCH
+    return DEFAULT_TARGET_WORKING_BYTES_PER_BATCH
 
 
 def _configure_thread_env(n_jobs: int) -> None:
@@ -171,9 +180,7 @@ def _normalize_labels(series: pd.Series) -> np.ndarray:
         mapped[~valid_mask] = float("nan")
         return mapped.to_numpy()
 
-    labels = numeric.astype(float)
-    labels = labels.mask(labels == 0)
-    return labels.to_numpy()
+    return numeric.astype(float).to_numpy()
 
 
 def _load_labels(path: str) -> np.ndarray:
@@ -253,7 +260,7 @@ def main() -> None:
     n_jobs = _resolve_n_jobs()
     prototypes_per_class = _resolve_prototypes_per_class()
     predict_batch_size_default = _resolve_predict_batch_size()
-    target_index_bytes_per_batch = _resolve_target_index_bytes_per_batch()
+    target_working_bytes_per_batch = _resolve_target_working_bytes_per_batch()
     _configure_thread_env(n_jobs)
 
     impute_values = _compute_impute_values(train_matrix)
@@ -263,23 +270,29 @@ def main() -> None:
         for sample_name, sample_df, sample_number in test_samples
     ]
 
+    train_array = np.asarray(
+        train_matrix.to_numpy(dtype=np.float32, copy=False), order='C'
+    )
     model, fit_stats = fit_prototype_model(
-        train_matrix=np.asarray(train_matrix.to_numpy(dtype=np.float32, copy=False), order='C'),
+        train_matrix=train_array,
         train_labels=train_labels,
         requested_n_jobs=n_jobs,
         prototypes_per_class=prototypes_per_class,
     )
-    predict_batch_size = batch_size_for_k(
-        fit_stats.k,
+    # Each class contributes at most this many prototype votes.
+    vote_neighbors = min(fit_stats.k, prototypes_per_class)
+    predict_batch_size = batch_size_for_prototypes(
+        fit_stats.prototype_count,
         default_batch_size=predict_batch_size_default,
-        min_batch_size=MIN_PREDICT_BATCH_SIZE,
-        target_index_bytes_per_batch=target_index_bytes_per_batch,
+        target_working_bytes_per_batch=target_working_bytes_per_batch,
     )
     print(
         (
             f"KNN-approx: k={fit_stats.k}, n_jobs={fit_stats.n_jobs_effective}, "
             f"batch_size={predict_batch_size}, prototypes={fit_stats.prototype_count}, "
-            f"per_class={prototypes_per_class}, target_index_bytes={target_index_bytes_per_batch}"
+            f"per_class={prototypes_per_class}, "
+            f"target_working_bytes={target_working_bytes_per_batch}, "
+            f"vote_neighbors={vote_neighbors}, min_agreement={MIN_LABEL_AGREEMENT}"
         ),
         flush=True,
     )
@@ -295,6 +308,8 @@ def main() -> None:
                 model,
                 sample_df.to_numpy(),
                 batch_size=predict_batch_size,
+                n_neighbors=vote_neighbors,
+                min_agreement=MIN_LABEL_AGREEMENT,
             )
             out_labels = [str(int(label)) for label in predictions]
 
